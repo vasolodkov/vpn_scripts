@@ -1,0 +1,5 @@
+pywin32
+pyad
+requests
+ldap3
+paramiko
