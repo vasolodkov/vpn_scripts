@@ -18,7 +18,7 @@
 import sys
 import requests
 from requests.auth import HTTPBasicAuth
-from pyad import pyad
+from ldap3 import Server, Connection, ALL, NTLM, SUBTREE
 import ruamel.yaml as yaml
 
 with open('config.yaml') as stream:
@@ -32,14 +32,14 @@ d_admin = config['d_admin']
 d_pass = config['d_pass']
 hd_user = config['hd_user']
 hd_pass = config['hd_pass']
+base = config['base']
+group_to_remove_prefix = config['group_to_remove_prefix']
 url = config['url']
 
 try:
-    d_user = sys.argv[1]
-    task_id = sys.argv[2]
+    task_id = sys.argv[1]
 except IndexError as err:
     print('Error: ', err)
-    d_user = input('type full username: ')
     task_id = input('type task id: ')
 
 url_task_life_time = url + 'tasklifetime/?taskid='
@@ -82,34 +82,43 @@ if response.json()['Statuses'][0]['Id'] is not 27:
 elif response.json()['Statuses'][0]['Id'] is 27:
     print('Task is in progress')
 
-pyad.set_defaults(ldap_server=dc, username=d_admin, password=d_pass)
+d_user = response.json()['Task']['Field115']
+
+server = Server(dc, get_info=ALL)
+conn = Connection(server, user=d_admin, password=d_pass, auto_bind=True)
+conn_bind()  # must be True
+
+search_filter_user = f'(&(objectClass=Person) (sn={d_user}))'
+conn.search(search_base=base, search_filter=search_filter_user,
+            attributes=['sAMAccountName', 'cn', 'memberOf'])
+user_cn = conn.entries[-1].cn.values[0]
+user_dn = conn.entries[-1].entry_dn
+user_groups = conn.entries[-1].memberOf
+
+search_filter_group = f'(&(objectClass=group) (name={vpn_group}))'
+conn.search(search_base=base, search_fscope=SUBTREE,
+            search_filter=search_filter_group)
+group_dn = conn.entries[0].entry_dn
+
+for i in user_groups:
+    if group_to_remove_prefix in i:
+        group_to_remove = i
 
 try:
-    user = pyad.aduser.ADUser.from_cn(d_user)
-except:
-    print(f'no user {d_user}')
-    d_user = input('type full username')
+    conn.extend.microsoft.remove_members_from_groups(user_dn, group_to_remove)
+except NameError:
+    print(f'{user_cn} not in vpn group')
 
-try:
-    group = pyad.adgroup.ADGroup.from_cn(vpn_group)
-except:
-    print(f'no vpn group {vpn_group}')
-    vpn_group = input('type vpn group')
+conn.extend.microsoft.add_members_to_groups(user_dn, group_dn)
 
-# get groups of user and remove user from VPN_RA_* groups
-for i in user.get_memberOfs():
-    if 'VPN_RA' in i.CN:
-        print('remove from group ', i.CN)
-        user.remove_from_group(i)
+# checking
+search_filter_user = f'(&(objectClass=Person) (sn={d_user}))'
+conn.search(search_base=base, search_filter=search_filter_user,
+            attributes=['sAMAccountName', 'cn', 'memberOf'])
+user_groups = conn.entries[-1].memberOf
 
-# user.add_to_group(vpn_group)
-group.add_members([user])
-
-# check: get user again
-user = pyad.aduser.ADUser.from_cn(d_user)
-for i in user.get_memberOfs():
-    if 'VPN_RA' in i.CN:
-        print('user added to ', i.CN)
+if group_dn in user_groups:
+    print(f'{user_cn} in {vpn_group}')
 
 # create task expenses
 data = {'taskid': task_id, 'Minutes': '2',
@@ -121,9 +130,9 @@ response = requests.get((url_task_expenses + task_id), headers=headers,
 
 # set status 'complete'
 params = {'include': ['status']}
-response = requests.get((url_task + task_id), headers=headers,
-                        auth=HTTPBasicAuth(hd_user, hd_pass),
-                        verify=False, params=params)
+response = requests.post((url_task + task_id), headers=headers,
+                         auth=HTTPBasicAuth(hd_user, hd_pass),
+                         verify=False, params=params)
 
 if response.json()['Statuses'][0]['Id'] is not 29:
     data = {'taskid': task_id, 'Id': '29',
